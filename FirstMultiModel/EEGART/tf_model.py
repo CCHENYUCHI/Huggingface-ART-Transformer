@@ -357,19 +357,57 @@ class ARTModel(PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = make_model(
-            src_vocab=config.src_channel_size,
-            tgt_vocab=config.src_channel_size,
-            N=config.N,
-            d_model=config.d_model,
-            d_ff=config.d_ff,
-            h=config.h,
-            dropout=config.dropout,
+
+        self.c = copy.deepcopy
+        self.attn = MultiHeadedAttention(config.h, config.d_model)
+        self.ff = PositionwiseFeedForward(config.d_model, config.d_ff, config.dropout)
+        self.position = PositionalEncoding(config.d_model, config.dropout)
+        self.encoder = Encoder(EncoderLayer(config.d_model, self.c(self.attn), self.c(self.ff), config.dropout), config.N)
+        self.decoder = Decoder(DecoderLayer(config.d_model, self.c(self.attn), self.c(self.attn),
+                                self.c(self.ff), config.dropout), config.N)
+        self.src_embed = nn.Sequential(ExpandConv(config.d_model, config.src_channel_size), self.c(self.position))
+        self.tgt_embed = nn.Sequential(ExpandConv(config.d_model, config.tgt_channel_size), self.c(self.position))
+        self.generator = Generator(config.d_model, config.tgt_channel_size)
+        self.loss_fct = nn.MSELoss()
+
+    def forward(self,
+        src = torch.FloatTensor, 
+        tgt = torch.FloatTensor, 
+        src_mask: Optional[torch.FloatTensor] = None, 
+        tgt_mask: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.FloatTensor] = None,
+        return_dict: Optional[bool] = None,
+        # return_loss: Optional[bool] = None,
+        ):
+        "Take in and process masked src and target sequences."
+        encoder_output = self.encoder(self.src_embed(src), src_mask)
+        decoder_output = self.decoder(self.tgt_embed(tgt), encoder_output, src_mask, tgt_mask)
+    
+        logits = self.generator(decoder_output).transpose(1,2)
+        
+        loss = None
+        if labels is not None:
+            # Compute the z-scores
+            logits_mean = torch.mean(logits, dim=0, keepdim=True)
+            logits_std = torch.std(logits, dim=0, keepdim=True)
+            logits_norm = (logits - logits_mean) / (logits_std + 1e-10)
+
+            labels_mean = torch.mean(labels, dim=0, keepdim=True)
+            labels_std = torch.std(labels, dim=0, keepdim=True)
+            labels_norm = (labels - labels_mean) / (labels_std + 1e-10)
+            loss = self.loss_fct(logits_norm, labels_norm)
+
+        if not return_dict:
+            return logits
+        
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=None,
+            hidden_states=None,
+            attentions=None,
         )
-
-    def forward(self, src, tgt, src_mask, tgt_mask):
-        return self.model.forward(src, tgt, src_mask, tgt_mask)
-
+    
 class ARTCLSModel(PreTrainedModel):
     """
         Huggingface需要兩種Model,BaseModel以及Training Model。
@@ -397,15 +435,26 @@ class ARTCLSModel(PreTrainedModel):
         #     if p.dim() > 1:
         #         nn.init.xavier_uniform(p)
 
-    def forward(self, src, src_mask = None):
-        "Take in and process masked src and target sequences."
-        encoder_output = self.encoder(self.src_embed(src), src_mask)
-        x =  self.cls(encoder_output)
+    def forward(self, 
+        src = Optional[torch.FloatTensor], 
+        src_mask = Optional[torch.FloatTensor],
+        return_dict: Optional[bool] = None,
+        ):
 
+        "Take in and process masked src and target sequences."
+        encoder_outputs = self.encoder(self.src_embed(src), src_mask)
+
+        last_hidden_state = encoder_outputs
+        
+        last_hidden_state =  self.cls(last_hidden_state)
+
+        # if not return_dict:
+        #     return (last_hidden_state,) + encoder_outputs[1:]
+        
         return BaseModelOutput(
-            last_hidden_state = x,
-            hidden_states = None,
-            attentions = None
+            last_hidden_state=last_hidden_state,
+            hidden_states=last_hidden_state,
+            attentions=None,
         )
 
 class ART_CLS_PreTrain(PreTrainedModel):
@@ -417,11 +466,14 @@ class ART_CLS_PreTrain(PreTrainedModel):
     def forward(self,
         src: Optional[torch.Tensor] = None, 
         src_mask: Optional[torch.Tensor] = None, 
-        labels: Optional[torch.Tensor] = None):
+        labels: Optional[torch.Tensor] = None
+        ):
 
         modeloutput = self.model(src, src_mask)
         logits = modeloutput.last_hidden_state.squeeze(dim=1)   # shape: [32, 2]
         loss_fct = CrossEntropyLoss()
+
+        loss = None
         if labels is not None:
             loss = loss_fct(logits, labels)
         
