@@ -10,29 +10,29 @@ from tf_utils import draw
 import time
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import BaseModelOutput, CausalLMOutputWithPast
-from tf_config import ARTConfig, ARTEncoder_CLSConfig
+from tf_config import ARTConfig, ARTEncoder_CLSConfig, SLTConfig
 
 # ---------------------Encoder and Decoder Stacks--------------------
-class ART(nn.Module):
-    """
-    A standard Encoder-Decoder architecture. Base for this and many 
-    other models.
-    """
-    def __init__(self, encoder, decoder, src_embed, tgt_embed, generator):
-        super(ART, self).__init__()
-        self.encoder = encoder
-        self.decoder = decoder
-        self.src_embed = src_embed
-        self.tgt_embed = tgt_embed
-        self.generator = generator
+# class ART(nn.Module):
+#     """
+#     A standard Encoder-Decoder architecture. Base for this and many 
+#     other models.
+#     """
+#     def __init__(self, encoder, decoder, src_embed, tgt_embed, generator):
+#         super(ART, self).__init__()
+#         self.encoder = encoder
+#         self.decoder = decoder
+#         self.src_embed = src_embed
+#         self.tgt_embed = tgt_embed
+#         self.generator = generator
 
         
-    def forward(self, src, tgt, src_mask, tgt_mask):
-        "Take in and process masked src and target sequences."
-        x = self.encoder(self.src_embed(src), src_mask)
-        x = self.decoder(self.tgt_embed(tgt), x, src_mask, tgt_mask)
+#     def forward(self, src, tgt, src_mask, tgt_mask):
+#         "Take in and process masked src and target sequences."
+#         x = self.encoder(self.src_embed(src), src_mask)
+#         x = self.decoder(self.tgt_embed(tgt), x, src_mask, tgt_mask)
     
-        return self.generator(x).transpose(1,2)
+#         return self.generator(x).transpose(1,2)
         
 
 class Generator(nn.Module):
@@ -327,30 +327,6 @@ class PositionalEncoding(nn.Module):
                          requires_grad=False)
         # print(x.shape)
         return self.dropout(x)
-    
-def make_model(src_vocab, tgt_vocab, N=6,
-               d_model=128, d_ff=2048, h=8, dropout=0.1):
-    "Helper: Construct a model from hyperparameters."
-    c = copy.deepcopy
-    attn = MultiHeadedAttention(h, d_model)
-    ff = PositionwiseFeedForward(d_model, d_ff, dropout)
-    position = PositionalEncoding(d_model, dropout)
-    model = ART(
-        Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N),
-        Decoder(DecoderLayer(d_model, c(attn), c(attn),
-                             c(ff), dropout), N),
-        #nn.Sequential(Embeddings(d_model, src_vocab), c(position)),
-        #nn.Sequential(Embeddings(d_model, tgt_vocab), c(position)),
-        nn.Sequential(ExpandConv(d_model, src_vocab), c(position)),
-        nn.Sequential(ExpandConv(d_model, tgt_vocab), c(position)),
-        Generator(d_model, tgt_vocab))
-
-    # This was important from their code.
-    # Initialize parameters with Glorot / fan_avg.
-    for p in model.parameters():
-        if p.dim() > 1:
-            nn.init.xavier_uniform(p)
-    return model
 
 class ARTModel(PreTrainedModel):
     config_class = ARTConfig
@@ -366,7 +342,7 @@ class ARTModel(PreTrainedModel):
         self.decoder = Decoder(DecoderLayer(config.d_model, self.c(self.attn), self.c(self.attn),
                                 self.c(self.ff), config.dropout), config.N)
         self.src_embed = nn.Sequential(ExpandConv(config.d_model, config.src_channel_size), self.c(self.position))
-        self.tgt_embed = nn.Sequential(ExpandConv(config.d_model, config.tgt_channel_size), self.c(self.position))
+        self.tgt_embed = nn.Sequential(ExpandConv(config.d_model, config.src_channel_size), self.c(self.position))
         self.generator = Generator(config.d_model, config.tgt_channel_size)
         self.loss_fct = nn.MSELoss()
 
@@ -385,6 +361,9 @@ class ARTModel(PreTrainedModel):
     
         logits = self.generator(decoder_output).transpose(1,2)
         
+        if not return_dict:
+            return logits
+        
         loss = None
         if labels is not None:
             # Compute the z-scores
@@ -396,9 +375,6 @@ class ARTModel(PreTrainedModel):
             labels_std = torch.std(labels, dim=0, keepdim=True)
             labels_norm = (labels - labels_mean) / (labels_std + 1e-10)
             loss = self.loss_fct(logits_norm, labels_norm)
-
-        if not return_dict:
-            return logits
         
         return CausalLMOutputWithPast(
             loss=loss,
@@ -408,6 +384,53 @@ class ARTModel(PreTrainedModel):
             attentions=None,
         )
     
+class SLTModel(PreTrainedModel):
+    config_class = SLTConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+
+        self.ART = ARTModel(config)
+        self.generator = nn.Linear(config.sensor_time, config.source_voxel_time)
+        self.loss_fct = nn.MSELoss()
+
+    def forward(self,
+        src = torch.FloatTensor, 
+        tgt = torch.FloatTensor, 
+        src_mask: Optional[torch.FloatTensor] = None, 
+        tgt_mask: Optional[torch.FloatTensor] = None, 
+        labels: Optional[torch.FloatTensor] = None, 
+        return_dict: Optional[bool] = None, 
+        # return_loss: Optional[bool] = None, 
+        ):
+
+        art_output = self.ART(src, tgt, src_mask, tgt_mask, labels=None, return_dict=None)
+        logits = self.generator(art_output)
+
+        if not return_dict:
+            return logits
+
+        loss = None
+        if labels is not None:
+            # Compute the z-scores
+            logits_mean = torch.mean(logits, dim=0, keepdim=True)
+            logits_std = torch.std(logits, dim=0, keepdim=True)
+            logits_norm = (logits - logits_mean) / (logits_std + 1e-10)
+
+            labels_mean = torch.mean(labels, dim=0, keepdim=True)
+            labels_std = torch.std(labels, dim=0, keepdim=True)
+            labels_norm = (labels - labels_mean) / (labels_std + 1e-10)
+
+            loss = self.loss_fct(logits_norm.float(), labels_norm.float())
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=None,
+            hidden_states=None,
+            attentions=None,
+        )
+
 class ARTCLSModel(PreTrainedModel):
     """
         Huggingface需要兩種Model,BaseModel以及Training Model。

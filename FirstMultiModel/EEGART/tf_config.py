@@ -63,6 +63,21 @@ class ARTConfig(PretrainedConfig):
             self.h = h
             self.dropout = dropout
 
+class SLTConfig(ARTConfig):
+
+    model_type = "SLT"
+
+    def __init__(
+            self,
+            source_voxel_time = 200,
+            sensor_time = 512,
+            **kwargs,
+        ):
+            super().__init__(**kwargs)
+
+            self.source_voxel_time = source_voxel_time
+            self.sensor_time = sensor_time
+
 
 class ARTEncoder_CLSConfig(PretrainedConfig):
     r"""
