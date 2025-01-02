@@ -403,7 +403,7 @@ class SLTModel(PreTrainedModel):
         return_dict: Optional[bool] = None, 
         # return_loss: Optional[bool] = None, 
         ):
-
+        # print(src.shape, tgt.shape, labels, return_dict)
         art_output = self.ART(src, tgt, src_mask, tgt_mask, labels=None, return_dict=None)
         logits = self.generator(art_output)
 
@@ -412,7 +412,13 @@ class SLTModel(PreTrainedModel):
 
         loss = None
         if labels is not None:
-            # Compute the z-scores
+            # Compute the z-scores  
+            if torch.isnan(logits).any():
+                print("Logits contain NaN:", logits)
+            if torch.isnan(labels).any():
+                print("Labels contain NaN:", labels)
+
+
             logits_mean = torch.mean(logits, dim=0, keepdim=True)
             logits_std = torch.std(logits, dim=0, keepdim=True)
             logits_norm = (logits - logits_mean) / (logits_std + 1e-10)
@@ -420,8 +426,14 @@ class SLTModel(PreTrainedModel):
             labels_mean = torch.mean(labels, dim=0, keepdim=True)
             labels_std = torch.std(labels, dim=0, keepdim=True)
             labels_norm = (labels - labels_mean) / (labels_std + 1e-10)
+            if torch.isnan(logits_norm).any():
+                print("Logits_norm contain NaN:", logits_norm)
+            if torch.isnan(labels_norm).any():
+                print("Labels_norm contain NaN:", labels_norm)
+            loss = self.loss_fct(logits_norm, labels_norm)
+            # print(loss)
 
-            loss = self.loss_fct(logits_norm.float(), labels_norm.float())
+
 
         return CausalLMOutputWithPast(
             loss=loss,
