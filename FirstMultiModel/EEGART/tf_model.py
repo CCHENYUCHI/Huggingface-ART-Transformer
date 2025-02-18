@@ -214,9 +214,10 @@ class MultiHeadedAttention(nn.Module):
             # Same mask applied to all h heads.
             mask = mask.unsqueeze(1)
         nbatches = query.size(0)
-        #print("MultiHeadedAttention1:", query.shape, key.shape, value.shape, mask.shape)
+        # print("MultiHeadedAttention1:", query.shape, key.shape, value.shape, mask.shape)
         
         # 1) Do all the linear projections in batch from d_model => h x d_k 
+
         query, key, value = \
             [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
              for l, x in zip(self.linears, (query, key, value))]
@@ -349,7 +350,7 @@ class ARTModel(PreTrainedModel):
     def forward(self,
         src = torch.FloatTensor, 
         tgt = torch.FloatTensor, 
-        src_mask: Optional[torch.FloatTensor] = None, 
+        src_mask: Optional[torch.FloatTensor] = None,
         tgt_mask: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.FloatTensor] = None,
         return_dict: Optional[bool] = None,
@@ -357,7 +358,7 @@ class ARTModel(PreTrainedModel):
         ):
         "Take in and process masked src and target sequences."
         encoder_output = self.encoder(self.src_embed(src), src_mask)
-        decoder_output = self.decoder(self.tgt_embed(tgt), encoder_output, src_mask, tgt_mask)
+        decoder_output = self.decoder(self.tgt_embed(src), encoder_output, src_mask, tgt_mask)
     
         logits = self.generator(decoder_output).transpose(1,2)
         
@@ -435,6 +436,72 @@ class SLTModel(PreTrainedModel):
 
 
 
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=None,
+            hidden_states=None,
+            attentions=None,
+        )
+
+
+class SLTModel_ver2(PreTrainedModel):
+    config_class = SLTConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+
+        self.c = copy.deepcopy
+        self.encoder_attn = MultiHeadedAttention(config.h, config.src_d_model)
+        self.decoder_attn = MultiHeadedAttention(config.h, config.tgt_d_model)
+        self.encoder_ff = PositionwiseFeedForward(config.src_d_model, config.d_ff, config.dropout)
+        self.decoder_ff = PositionwiseFeedForward(config.tgt_d_model, config.d_ff, config.dropout)
+        self.position = PositionalEncoding(config.d_model, config.dropout)
+        self.encoder = Encoder(EncoderLayer(config.src_d_model, self.c(self.encoder_attn), self.c(self.encoder_ff),
+                                             config.dropout), config.N)
+        self.decoder = Decoder(DecoderLayer(config.tgt_d_model, self.c(self.decoder_attn), self.c(self.decoder_attn),
+                                self.c(self.decoder_ff), config.dropout), config.N)
+        self.src_embed = nn.Sequential(ExpandConv(config.src_d_model, config.src_channel_size), self.c(self.position))
+        self.tgt_embed = nn.Sequential(ExpandConv(config.src_d_model, config.src_channel_size), self.c(self.position))
+        self.generator_chan = Generator(config.src_d_model, config.tgt_channel_size)
+        self.generator_time = nn.Linear(config.sensor_time, config.source_voxel_time)
+        self.loss_fct = nn.MSELoss()
+
+    def forward(self,
+        src = torch.FloatTensor, 
+        tgt = torch.FloatTensor, 
+        src_mask: Optional[torch.FloatTensor] = None, 
+        tgt_mask: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.FloatTensor] = None,
+        return_dict: Optional[bool] = None,
+        # return_loss: Optional[bool] = None,
+        ):
+        "Take in and process masked src and target sequences."
+        encoder_output = self.encoder(self.src_embed(src), src_mask)
+        tgt_tp = self.tgt_embed(tgt).transpose(1,2)
+        encoder_output = encoder_output.transpose(1, 2)
+        decoder_output = self.decoder(tgt_tp, encoder_output, tgt_mask, tgt_mask).transpose(1,2)
+        # print(f"Decoder_output shape: {decoder_output.shape}")
+        output_chan_gen = self.generator_chan(decoder_output).transpose(1,2)
+        # print(f"generator outpout shpae: {output_chan_gen.shape}")
+        logits = self.generator_time(output_chan_gen)
+        
+        
+        if not return_dict:
+            return logits
+        
+        loss = None
+        if labels is not None:
+            # Compute the z-scores
+            logits_mean = torch.mean(logits, dim=0, keepdim=True)
+            logits_std = torch.std(logits, dim=0, keepdim=True)
+            logits_norm = (logits - logits_mean) / (logits_std + 1e-10)
+
+            labels_mean = torch.mean(labels, dim=0, keepdim=True)
+            labels_std = torch.std(labels, dim=0, keepdim=True)
+            labels_norm = (labels - labels_mean) / (labels_std + 1e-10)
+            loss = self.loss_fct(logits_norm, labels_norm)
+        
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
