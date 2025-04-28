@@ -83,10 +83,12 @@ class Encoder(nn.Module):
         
     def forward(self, x, mask):
         "Pass the input (and mask) through each layer in turn."
+        atten_list = []
         for layer in self.layers:
-            x = layer(x, mask)
+            x, atten = layer(x, mask)
             # print(f"Encoder x size:{x.shape}")
-        return self.norm(x)
+            atten_list.append(atten)
+        return self.norm(x), atten_list
         
 class LayerNorm(nn.Module):
     "Construct a layernorm module (See citation for details)."
@@ -114,23 +116,34 @@ class SublayerConnection(nn.Module):
 
     def forward(self, x, sublayer):
         "Apply residual connection to any sublayer with the same size."
-        return x + self.dropout(sublayer(self.norm(x)))
+        hidden, atten = sublayer(self.norm(x))
+        return x + self.dropout(hidden), atten
 
 class EncoderLayer(nn.Module):
     "Encoder is made up of self-attn and feed forward (defined below)"
     def __init__(self, size, self_attn, feed_forward, dropout):
         super(EncoderLayer, self).__init__()
+        self.norm = LayerNorm(size)
+        self.dropout = nn.Dropout(dropout)
         self.self_attn = self_attn
         self.feed_forward = feed_forward
-        self.sublayer = clones(SublayerConnection(size, dropout), 2)
+        # self.sublayer = clones(SublayerConnection(size, dropout), 2)
+
         self.size = size
 
     def forward(self, x, mask):
         "Follow Figure 1 (left) for connections."
-        # print(f"Mask size: {mask.shape}")
-        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
-        # print("EncoderLayer2: ", x.shape, type(x))
-        return self.sublayer[1](x, self.feed_forward)
+
+        hidden = self.norm(x)
+        hidden, atten = self.self_attn(hidden, hidden, hidden, mask)
+        hidden = self.dropout(hidden)
+        x = x + hidden
+        hidden = self.norm(x)
+        hidden = self.feed_forward(hidden)
+        hidden = self.dropout(hidden)
+        x = x + hidden
+
+        return x, atten
 
 # ---------------------Decoder--------------------
 class Decoder(nn.Module):
@@ -140,35 +153,53 @@ class Decoder(nn.Module):
         self.layers = clones(layer, N)
         self.norm = LayerNorm(layer.size)
         
-    def forward(self, x, memory, src_mask, tgt_mask):
+    def forward(self, x, memory, src_mask, tgt_mask, l1_cs=False):
+        atten_list = []
         for layer in self.layers:
-            x = layer(x, memory, src_mask, tgt_mask)
-        return self.norm(x)
+            x, atten = layer(x, memory, src_mask, tgt_mask, l1_cs)
+            atten_list.append(atten)
+        return self.norm(x), atten_list
 
 class DecoderLayer(nn.Module):
     "Decoder is made of self-attn, src-attn, and feed forward (defined below)"
     def __init__(self, size, self_attn, src_attn, feed_forward, dropout):
         super(DecoderLayer, self).__init__()
+        self.norm = LayerNorm(size)
+        self.dropout = nn.Dropout(dropout)
         self.size = size
         self.self_attn = self_attn
         self.src_attn = src_attn
         self.feed_forward = feed_forward
-        self.sublayer = clones(SublayerConnection(size, dropout), 3)
+        # self.sublayer = clones(SublayerConnection(size, dropout), 3)
  
-    def forward(self, x, memory, src_mask, tgt_mask):
+    def forward(self, x, memory, src_mask, tgt_mask, 
+                l1_cs): # layer one do cross attention
         "Follow Figure 1 (right) for connections."
-        m = memory
-        # print("DecoderLayer1:", x.shape)
-        # print("DecoderLayer2:", memory.shape)
-        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
-        # print("DecoderLayer3:", src_mask.shape)
-        # print("DecoderLayer4:", tgt_mask.shape)
-        x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
-        # print("DecoderLayer5:", tgt_mask.shape)
-        x = self.sublayer[2](x, self.feed_forward)
-        # print("DecoderLayer6:", tgt_mask.shape)
-        time.sleep(5)
-        return x
+        # First SA
+        if not l1_cs:
+            hidden = self.norm(x)
+            hidden, atten_1 = self.self_attn(hidden, hidden, hidden, tgt_mask)
+            hidden = self.dropout(hidden)
+            x = x + hidden
+        else:
+            hidden = self.norm(x)
+            hidden, atten_1 = self.self_attn(hidden, memory, memory)
+            hidden = self.dropout(hidden)
+            x = x + hidden
+
+        # Second cross SA
+        hidden = self.norm(x)
+        hidden, atten_2 = self.self_attn(hidden, memory, memory)
+        hidden = self.dropout(hidden)
+        x = x + hidden
+
+        hidden = self.norm(x)
+        hidden = self.feed_forward(hidden)
+        hidden = self.dropout(hidden)
+        x = x + hidden
+
+        return x, (atten_1, atten_2)
+
 
 
 def subsequent_mask(size):
@@ -181,7 +212,7 @@ def subsequent_mask(size):
 #---------------------Attention--------------------        
 def attention(query, key, value, mask=None, dropout=None):
     "Compute 'Scaled Dot Product Attention'"
-    # print("attention1:", query.shape, key.transpose(-2, -1).shape, value.shape, mask.shape)
+    # print("attention1:", query.shape, key.transpose(-2, -1).shape, value.shape)
     d_k = query.size(-1)
     scores = torch.matmul(query, key.transpose(-2, -1)) \
              / math.sqrt(d_k)
@@ -251,7 +282,7 @@ class MultiHeadedAttention(nn.Module):
         print("MultiHeadedAttention5:", temp.shape)
         draw(3, temp[0, :, :], "Linear Proj")
         '''
-        return self.linears[-1](x)
+        return self.linears[-1](x), self.attn
 
 
 # ---------------------Position-wise Feed-Forward Networks--------------------
@@ -280,6 +311,33 @@ class PositionwiseFeedForward(nn.Module):
         '''
         return self.w_2(self.dropout(F.relu(self.w_1(x))))
 
+class MLP_projector(nn.Module):
+    def __init__(self, in_dim, hidden_dim, out_dim, squence_size):
+        super(MLP_projector, self).__init__()
+        self.layer1 = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.BatchNorm1d(squence_size),
+            nn.ReLU(inplace=True)
+        )
+        self.layer2 = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(squence_size),
+            nn.ReLU(inplace=True)
+        )
+        self.layer3 = nn.Sequential(
+            nn.Linear(hidden_dim, out_dim),
+            nn.BatchNorm1d(squence_size)
+        )
+
+    def forward(self, x):
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+
+        return x 
+
+
 # ---------------------Embeddings--------------------
 class Embeddings(nn.Module):
     def __init__(self, d_model, vocab):
@@ -288,13 +346,13 @@ class Embeddings(nn.Module):
         self.d_model = d_model
 
     def forward(self, x):
-        #a = self.lut(x)
-        #print("Embeddings:", a.shape)
+        # a = self.lut(x)
+        # print("Embeddings:", a.shape)
         return self.lut(x) * math.sqrt(self.d_model)
 
 # ---------------------ExpandConv--------------------
 class ExpandConv(nn.Module):
-    def __init__(self, d_model, vocab):
+    def __init__(self, vocab, d_model):
         super(ExpandConv, self).__init__()
         self.lut = nn.Conv1d(in_channels=vocab, out_channels=d_model, kernel_size=1)
         self.d_model = d_model
@@ -390,9 +448,23 @@ class SLTModel(PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
+        self.c = copy.deepcopy
+       
+        self.attn = MultiHeadedAttention(config.h, config.d_model)
+        self.ff = PositionwiseFeedForward(config.d_model, config.d_ff, config.dropout)
+        self.position = PositionalEncoding(config.d_model, config.dropout)
+        self.encoder = Encoder(EncoderLayer(config.d_model, self.c(self.attn), self.c(self.ff), config.dropout), config.N)
+        self.decoder = Decoder(DecoderLayer(config.d_model, self.c(self.attn), self.c(self.attn),
+                                self.c(self.ff), config.dropout), config.N)
+        
+        self.src_projector = nn.Sequential(MLP_projector(config.sensor_time, config.d_ff, config.d_model, config.src_channel_size), self.c(self.position))
+        self.tgt_projector = nn.Sequential(MLP_projector(config.source_voxel_time, config.d_ff, config.d_model, config.tgt_channel_size), self.c(self.position))
 
-        self.ART = ARTModel(config)
-        self.generator = nn.Linear(config.sensor_time, config.source_voxel_time)
+        # self.src_embed = nn.Sequential(ExpandConv(config.sensor_time, config.d_model), self.c(self.position))
+        # self.tgt_embed = nn.Sequential(ExpandConv(config.source_voxel_time, config.d_model), self.c(self.position))
+
+        self.generator = nn.Linear(config.d_model, config.source_voxel_time)
+        
         self.loss_fct = nn.MSELoss()
 
     def forward(self,
@@ -400,51 +472,147 @@ class SLTModel(PreTrainedModel):
         tgt = torch.FloatTensor, 
         src_mask: Optional[torch.FloatTensor] = None, 
         tgt_mask: Optional[torch.FloatTensor] = None, 
+        tgt_token_mask: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.FloatTensor] = None, 
         return_dict: Optional[bool] = None, 
         # return_loss: Optional[bool] = None, 
         ):
-        # print(src.shape, tgt.shape, labels, return_dict)
-        art_output = self.ART(src, tgt, src_mask, tgt_mask, labels=None, return_dict=None)
-        logits = self.generator(art_output)
+        "Token be a channel"
+        encoder_output, encoder_atten = self.encoder(self.src_projector(src), src_mask)   
+        """ encoder: 
+                src shape: (b, 30, 100) -> embed (b, 30, d_model)
+                input shape:  (b, 30, d_model)
+                output shape:     (b, 30, d_model)
+        """
+        decoder_output, decoder_atten = self.decoder(self.tgt_projector(tgt), encoder_output, src_mask, tgt_mask, False)
+        """ decoder: 
+                tgt shape: (b, 204, 100) -> embed (b, 204, d_model)
+                input shape:            (b, 204, 100)
+                memory encoder shape:   (b, 30, 128)
+                attention score shape:  (b, 204, 30)
+                output shape:           (b, 204, 128)
+        """
+        logits = self.generator(decoder_output)
+
+        ### for add EEG into tgt
+        logits = logits[:, :204, :]
 
         if not return_dict:
             return logits
 
         loss = None
         if labels is not None:
-            # Compute the z-scores  
-            if torch.isnan(logits).any():
-                print("Logits contain NaN:", logits)
-            if torch.isnan(labels).any():
-                print("Labels contain NaN:", labels)
+
+            logits_mean = torch.mean(logits, dim=(1, 2), keepdim=True)
+            logits_std = torch.std(logits, dim=(1, 2), keepdim=True)
+            logits_norm = (logits - logits_mean) / (logits_std)
+
+            labels_mean = torch.mean(labels, dim=(1, 2), keepdim=True)
+            labels_std = torch.std(labels, dim=(1, 2), keepdim=True)
+            labels_norm = (labels - labels_mean) / (labels_std)
+
+            # Apply mask: tgt_token_mask is (batch, 204), expand to match (batch, 204, 100)
+            expanded_mask = tgt_token_mask.unsqueeze(-1).expand(-1, -1, logits.size(-1))  # shape (batch, 204, 100)
+            # Select only masked positions
+            masked_logits = logits_norm[expanded_mask]
+            masked_labels = labels_norm[expanded_mask]
+
+            # Compute loss only on masked elements
+            loss = self.loss_fct(masked_logits, masked_labels)
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=None,
+            hidden_states=(encoder_output, decoder_output),
+            attentions=(encoder_atten, decoder_atten),
+        )
+
+class pre_SLTModel(PreTrainedModel):
+    config_class = SLTConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.c = copy.deepcopy
+       
+        self.attn = MultiHeadedAttention(config.h, config.d_model)
+        self.ff = PositionwiseFeedForward(config.d_model, config.d_ff, config.dropout)
+        self.position = PositionalEncoding(config.d_model, config.dropout)
+        self.encoder = Encoder(EncoderLayer(config.d_model, self.c(self.attn), self.c(self.ff), config.dropout), config.N)
+        self.decoder = Decoder(DecoderLayer(config.d_model, self.c(self.attn), self.c(self.attn),
+                                self.c(self.ff), config.dropout), config.N)
+        
+        self.src_projector = nn.Sequential(MLP_projector(config.sensor_time, config.d_ff, config.d_model, config.src_channel_size), self.c(self.position))
+        self.tgt_projector = nn.Sequential(MLP_projector(config.source_voxel_time, config.d_ff, config.d_model, config.tgt_channel_size), self.c(self.position))
+
+        # self.src_embed = nn.Sequential(ExpandConv(config.sensor_time, config.d_model), self.c(self.position))
+        # self.tgt_embed = nn.Sequential(ExpandConv(config.source_voxel_time, config.d_model), self.c(self.position))
 
 
-            logits_mean = torch.mean(logits, dim=0, keepdim=True)
-            logits_std = torch.std(logits, dim=0, keepdim=True)
-            logits_norm = (logits - logits_mean) / (logits_std + 1e-10)
+        self.generator = nn.Linear(config.d_model, config.source_voxel_time)
+        
+        self.loss_fct = nn.MSELoss()
 
-            labels_mean = torch.mean(labels, dim=0, keepdim=True)
-            labels_std = torch.std(labels, dim=0, keepdim=True)
-            labels_norm = (labels - labels_mean) / (labels_std + 1e-10)
-            if torch.isnan(logits_norm).any():
-                print("Logits_norm contain NaN:", logits_norm)
-            if torch.isnan(labels_norm).any():
-                print("Labels_norm contain NaN:", labels_norm)
-            loss = self.loss_fct(logits_norm, labels_norm)
-            # print(loss)
+    def forward(self,
+        src = torch.FloatTensor, 
+        tgt = torch.FloatTensor, 
+        src_mask: Optional[torch.FloatTensor] = None, 
+        tgt_mask: Optional[torch.FloatTensor] = None, 
+        tgt_token_mask: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.FloatTensor] = None, 
+        return_dict: Optional[bool] = None, 
+        # return_loss: Optional[bool] = None, 
+        ):
+        "Token be a channel"
+        encoder_output, encoder_atten = self.encoder(self.src_projector(src), src_mask)   
+        """ encoder: 
+                src shape: (b, 30, 100) -> embed (b, 30, d_model)
+                input shape:  (b, 30, d_model)
+                output shape:     (b, 30, d_model)
+        """
+        decoder_output, decoder_atten = self.decoder(self.tgt_projector(tgt), encoder_output, src_mask, tgt_mask, False)
+        """ decoder: 
+                tgt shape: (b, 204, 100) -> embed (b, 204, d_model)
+                input shape:            (b, 204, 100)
+                memory encoder shape:   (b, 30, 128)
+                attention score shape:  (b, 204, 30)
+                output shape:           (b, 204, 128)
+        """
+        logits = self.generator(decoder_output)
 
+
+        if not return_dict:
+            return logits
+
+        loss = None
+        if labels is not None:
+
+            logits_mean = torch.mean(logits, dim=(1, 2), keepdim=True)
+            logits_std = torch.std(logits, dim=(1, 2), keepdim=True)
+            logits_norm = (logits - logits_mean) / (logits_std)
+
+            labels_mean = torch.mean(labels, dim=(1, 2), keepdim=True)
+            labels_std = torch.std(labels, dim=(1, 2), keepdim=True)
+            labels_norm = (labels - labels_mean) / (labels_std)
+
+            # Apply mask: tgt_token_mask is (batch, 204), expand to match (batch, 204, 100)
+            expanded_mask = tgt_token_mask.unsqueeze(-1).expand(-1, -1, logits.size(-1))  # shape (batch, 204, 100)
+            # Select only masked positions
+            masked_logits = logits_norm[expanded_mask]
+            masked_labels = labels_norm[expanded_mask]
+
+            # Compute loss only on masked elements
+            loss = self.loss_fct(masked_logits, masked_labels)
 
 
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=None,
-            hidden_states=None,
-            attentions=None,
+            hidden_states=(encoder_output, decoder_output),
+            attentions=(encoder_atten, decoder_atten),
         )
-
-
+    
 class SLTModel_ver2(PreTrainedModel):
     config_class = SLTConfig
 

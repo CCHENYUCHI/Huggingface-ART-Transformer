@@ -10,6 +10,8 @@ import random
 from scipy.signal import decimate, resample_poly, firwin, lfilter
 from scipy.signal import resample
 from torch.utils.data import Dataset
+import bisect
+import glob
 
 def txt_to_dict_with_list(txt_file):
     try:
@@ -268,6 +270,273 @@ class EEGROIDataset(Dataset):
             "label": self.roi_data[idx]
         }
    
+class EEGROI_fft_Dataset(Dataset):
+    def __init__(self, roi_folder, eeg_folder, group_file , group_index, overlap=0.5, window_size=512, 
+                 segment_file= "G:\\共用雲端硬碟\\CNElab_陳昱祺\\source localization\\test_data\\ROI\\Desikan_Kilianny_with_3pca\\roi_removal_segment.txt"):
+        """
+        Args:
+            roi_folder (str): Path to the folder containing ROI .set files.
+            eeg_folder (str): Path to the folder containing EEG .set files.
+            overlap (float): Fraction of overlap between consecutive windows (0 <= overlap < 1).
+            window_size (int): Number of samples in each window.
+        """
+        self.roi_folder = roi_folder
+        self.eeg_folder = eeg_folder
+        self.group_file = group_file
+        self.group_index = group_index
+        self.overlap = overlap
+        self.window_size = window_size
+        self.subjects = self._get_subject_list()
+        self.segment_file = segment_file
+        self.segment_index = txt_to_dict_with_list(self.segment_file)
+
+        self.eeg_power_data = []  # Will store tuples of (ROI segment, EEG segment)
+        self.roi_power_data = []
+        self._prepare_dataset()
+
+    def _get_subject_list(self):
+        """Gets the list of subjects based on file names in the ROI folder."""
+        with open(self.group_file, 'r') as f:
+            groups = json.load(f)
+
+        subject_indices = groups.get(str(self.group_index), [])
+        print(subject_indices)
+        return subject_indices 
+
+    def _prepare_dataset(self):
+        """Reads and processes data for all subjects."""
+        for subject in self.subjects:
+            # start_time = time.time()
+            roi_path = os.path.join(self.roi_folder, f"{subject}_roi.npy")
+            eeg_path = os.path.join(self.roi_folder, f"{subject}_eeg.npy")
+
+            # 讀取 ROI & EEG
+            roi_data = np.load(roi_path)
+            eeg_data = np.load(eeg_path)
+
+            # end_time = time.time()
+            # print(f"Load Data time: {end_time - start_time}")
+            # Verify dimensions
+            # assert roi_data.shape[0] == 3, f"Unexpected ROI shape: {roi_data.shape}"
+            assert roi_data.shape[1] == 200, f"Unexpected ROI shape: {roi_data.shape}"
+            assert eeg_data.shape[0] == 30, f"Unexpected EEG shape: {eeg_data.shape}"
+
+            # Process and overlap data
+            # start_time = time.time()
+            self._process_subject_data(roi_data, eeg_data, subject_name=f"{subject}_ICA_DLtrain")
+            # end_time = time.time()
+            # print(f"Overlapping time: {end_time - start_time}")
+
+        print(f"EEG Power shape: {self.eeg_power_data[0].shape}")
+        print(f"Source Power shape: {self.roi_power_data[0].shape}")
+
+            
+    def _process_subject_data(self, roi_data, eeg_data, subject_name):
+        """Segments, computes EEG power spectrum, and predicts ROI power spectrum for a single subject."""
+
+        segment_len = roi_data.shape[0]
+        nan_count = 0
+        rand_count = 0
+
+        for start_idx in range(0, segment_len):
+            if start_idx not in self.segment_index[subject_name]:
+                # if random.random() < 1/3:
+                #     continue
+
+                eeg_segment_start = 256 * start_idx
+                eeg_segment_end = 256 * (start_idx + 2)
+
+                eeg = eeg_data[:, eeg_segment_start:eeg_segment_end]
+
+                # EEG Resampling
+                # 更快的批次 resample 方法
+                EEG = resample(eeg, 200, axis=1)  # 直接沿時間軸取樣到 200 點
+
+                # Convert to Torch Tensor
+                EEG = torch.tensor(EEG, dtype=torch.float32)
+
+                ROI = torch.tensor(roi_data[start_idx, :, :], dtype=torch.float32).squeeze(0).transpose(0, 1)
+
+                # FFT to get Power Spectrum
+                # FFT and Extract 0~50Hz
+                eeg_fft = torch.fft.rfft(EEG, dim=1)[:, :100]  # Keep only 0~50Hz
+                roi_fft = torch.fft.rfft(ROI, dim=1)[:, :100]  # Keep only 0~50Hz
+
+                eeg_power = torch.abs(eeg_fft) ** 2  # Compute Power Spectrum
+                roi_power = torch.abs(roi_fft) ** 2  # Compute Power Spectrum
+
+                # Normalize Power Spectrum (Z-score)
+                eeg_mean = torch.mean(eeg_power, dim=(0, 1), keepdim=True)
+                eeg_std = torch.std(eeg_power, dim=(0, 1), keepdim=True)
+                eeg_power = (eeg_power - eeg_mean) / (eeg_std)
+
+                roi_mean = torch.mean(roi_power, dim=(0, 1), keepdim=True)
+                roi_std = torch.std(roi_power, dim=(0, 1), keepdim=True)
+                roi_power = (roi_power - roi_mean) / (roi_std)
+
+                assert eeg_power.shape == (30, 100), f"Unexpected EEG Power shape: {eeg_power.shape}"
+                assert roi_power.shape == (204, 100), f"Unexpected ROI Power shape: {roi_power.shape}"
+
+                if not (torch.isnan(eeg_power).any() or torch.isinf(eeg_power).any()):
+                    if not (torch.isnan(roi_power).any() or torch.isinf(roi_power).any()):
+                        # Store Power Spectrum as training data
+                        self.eeg_power_data.append(eeg_power)
+                        self.roi_power_data.append(roi_power)
+                    else:
+                        nan_count += 1
+                else:
+                    nan_count += 1
+                rand_count += 1
+
+        # print(f"Total NaN count for subject: {nan_count}")
+        # print(f"Total Random count for subject: {rand_count}")
+
+    def __len__(self):
+        return len(self.eeg_power_data)
+
+    def __getitem__(self, idx):
+        return {
+            "src": self.eeg_power_data[idx], 
+            "label": self.roi_power_data[idx]
+        }
+        
+
+class EEGROI_Power_Dataset(Dataset):
+    def __init__(self, data_path):
+        """
+        Args:
+            roi_folder (str): Path to the folder containing ROI .set files.
+            eeg_folder (str): Path to the folder containing EEG .set files.
+            overlap (float): Fraction of overlap between consecutive windows (0 <= overlap < 1).
+            window_size (int): Number of samples in each window.
+        """
+        self.data_path = data_path
+
+        self.eeg_power_data = []  # Will store tuples of (ROI segment, EEG segment)
+        self.roi_power_data = []
+        self._prepare_dataset()
+
+    # def _prepare_dataset(self):
+
+        
+    #     # 讀取全部資料
+    #     all_eeg_data = np.load(os.path.join(self.data_path, "all_eeg_data.npy"), allow_pickle=True)
+    #     all_source_data = np.load(os.path.join(self.data_path, "all_source_data.npy"), allow_pickle=True)
+
+    #     EEG = torch.tensor(np.stack(all_eeg_data), dtype=torch.float32)  # (N, 64, 51)
+    #     ROI = torch.tensor(np.stack(all_source_data), dtype=torch.float32)  # (N, 204, 51)
+
+    #     # 建立 channel map (只做一次)
+    #     ch_idx_map = get_channel_index()
+
+    #     # 選出 32 channels
+    #     EEG = EEG[:, ch_idx_map, :]  # (N, 30, 51)
+
+    #     # 做 Z-score normalization
+    #     eeg_mean = EEG.mean(dim=2, keepdim=True)
+    #     eeg_std = EEG.std(dim=2, keepdim=True)
+    #     eeg_power = (EEG - eeg_mean) / (eeg_std + 1e-10)
+
+    #     roi_mean = ROI.mean(dim=2, keepdim=True)
+    #     roi_std = ROI.std(dim=2, keepdim=True)
+    #     roi_power = (ROI - roi_mean) / (roi_std + 1e-10)
+
+    #     # 篩掉含 NaN 的 sample
+    #     valid_mask = ~(torch.isnan(eeg_power).any(dim=(1, 2)) | torch.isinf(eeg_power).any(dim=(1, 2)) |
+    #                 torch.isnan(roi_power).any(dim=(1, 2)) | torch.isinf(roi_power).any(dim=(1, 2)))
+
+
+    #     self.eeg_power_data = eeg_power[valid_mask]
+    #     self.roi_power_data = roi_power[valid_mask]
+
+    #     print(f"EEG Power shape: {self.eeg_power_data.shape}")
+    #     print(f"Source Power shape: {self.roi_power_data.shape}")
+
+    def _prepare_dataset(self):
+        # 🔍 找出所有 .npy 檔案，並依照名稱排序
+        eeg_files = sorted(glob.glob(os.path.join(self.data_path, "*all_eeg_data_*.npy")))
+        src_files = sorted(glob.glob(os.path.join(self.data_path, "*all_source_data_*.npy")))
+
+        assert len(eeg_files) == len(src_files), "EEG 與 Source 資料數量不一致"
+        assert len(eeg_files) > 0, "no data"
+
+        all_eeg_data = []
+        all_source_data = []
+
+        # 📦 依序讀取所有檔案並收集
+        for eeg_file, src_file in zip(eeg_files, src_files):
+            eeg = np.load(eeg_file, allow_pickle=True)
+            src = np.load(src_file, allow_pickle=True)
+            # print(f"{eeg_file}: {eeg.shape} - {src.shape}")
+            all_eeg_data.extend(eeg)
+            all_source_data.extend(src)
+
+        # ➕ Stack 成 Tensor
+        EEG = torch.tensor(np.stack(all_eeg_data), dtype=torch.float32)  # (N, 64, T)
+        ROI = torch.tensor(np.stack(all_source_data), dtype=torch.float32)  # (N, 204, T)
+
+        # Channel map: 選 32 channels
+        ch_idx_map = get_channel_index()
+        EEG = EEG[:, ch_idx_map, :]  # (N, 32, T)
+
+        # Z-score normalization
+        eeg_mean = EEG.mean(dim=(1, 2), keepdim=True)
+        eeg_std = EEG.std(dim=(1, 2), keepdim=True)
+        eeg_power = (EEG - eeg_mean) / (eeg_std)
+
+        roi_mean = ROI.mean(dim=(1, 2), keepdim=True)
+        roi_std = ROI.std(dim=(1, 2), keepdim=True)
+        roi_power = (ROI - roi_mean) / (roi_std)
+        # print(f"eeg mean:{eeg_mean}, eeg std:{eeg_std}\nsource mea:{roi_mean}, source std:{roi_std}")
+
+        # ✅ 移除 NaN / inf
+        valid_mask = ~(torch.isnan(eeg_power).any(dim=(1, 2)) | torch.isinf(eeg_power).any(dim=(1, 2)) |
+                    torch.isnan(roi_power).any(dim=(1, 2)) | torch.isinf(roi_power).any(dim=(1, 2)))
+
+        self.eeg_power_data = eeg_power[valid_mask]
+        self.roi_power_data = roi_power[valid_mask]
+
+        print(f"EEG Power shape: {self.eeg_power_data.shape}")
+        print(f"Source Power shape: {self.roi_power_data.shape}")
+
+    def __len__(self):
+        return len(self.eeg_power_data)
+
+    def __getitem__(self, idx):
+        return {
+            "src": self.eeg_power_data[idx], 
+            "label": self.roi_power_data[idx]
+        }
+    
+class EEGROI_Merge_Dataset(Dataset):
+    def __init__(self, dataset_list):
+        self.dataset_list = dataset_list
+        self.cumulative_lengths = [0]
+        for dataset in dataset_list:
+            self.cumulative_lengths.append(self.cumulative_lengths[-1] + len(dataset))
+        self.len_ = self.cumulative_lengths[-1]
+
+    def map_idx(self, idx):
+        list_idx = bisect.bisect_right(self.cumulative_lengths, idx) - 1
+        item_idx = idx - self.cumulative_lengths[list_idx]
+        return list_idx, item_idx
+
+    def __len__(self):
+        return self.len_
+
+    def __getitem__(self, idx):
+        list_idx, item_idx = self.map_idx(idx)
+        return self.dataset_list[list_idx][item_idx]
+
+def get_channel_index():
+    # 建立 channel map (只做一次)
+    ch_names_64 = mne.io.read_raw('G:\\共用雲端硬碟\\CNElab_陳昱祺\\source localization\\simulate_data\\test_raw.fif', verbose='Warning').resample(100).info['ch_names']
+    ch_names_32 = ['Fp1', 'Fpz', 'Fp2', 'F7', 'F3', 'Fz', 'F4', 'F8', 'FC5', 'FC1', 'FC2', 'FC6', 
+                'T7', 'C3', 'Cz', 'C4', 'T8', 'CP5', 'CP1', 'CP2', 'CP6', 'P7', 'P3', 
+                'Pz', 'P4', 'P8', 'POz', 'O1', 'Oz', 'O2']
+    ch_idx_map = [ch_names_64.index(ch) for ch in ch_names_32]
+
+    return ch_idx_map
 
 # For Huggingface Trainer
 class SignalDataCollator:
@@ -282,3 +551,95 @@ class SignalDataCollator:
                 "tgt_mask": masks, 
                 "labels": labels, 
                 "return_dict": return_dict}
+    
+# class RandonMaskDataCollator:
+#     def __init__(self, mask_prob=0.15, tgt_type="simple"):
+#         self.mask_prob = mask_prob
+
+#     def __call__(self, features):
+#         inputs = torch.stack([f["src"] for f in features])  # (batch, 204, 100)
+#         labels = torch.stack([f["label"] for f in features])
+
+#         tgt = labels.clone()
+#         batch_size, seq_len, feature_dim = tgt.shape
+
+#         mask = torch.rand(batch_size, seq_len) < self.mask_prob  # (batch, 204)
+#         # print(f"Mask: {mask[0]}")
+
+#         # 準備三種mask策略
+#         mask_rand = torch.rand(batch_size, seq_len)
+
+#         # 80% 變0
+#         zero_mask = (mask_rand < 0.8) & mask
+#         # print(f"Zero Mask: {zero_mask[0]}")
+#         tgt[zero_mask.unsqueeze(-1).expand(-1, -1, feature_dim)] = 0.0
+
+#         # 10% 變 random noise
+#         random_mask = (mask_rand >= 0.8) & (mask_rand < 0.9) & mask
+#         # print(f"Random Mask: {random_mask[0]}")
+
+#         noise = torch.randn_like(tgt)
+#         tgt[random_mask.unsqueeze(-1).expand(-1, -1, feature_dim)] = noise[random_mask.unsqueeze(-1).expand(-1, -1, feature_dim)]
+
+#         # print(f"tgt: {tgt[0]}")
+
+#         # 10% 保持原樣（不需要動）
+
+#         # tgt_type 是否要加上EEG在tgt上。
+        
+
+#         return_dict = True
+#         return {
+#             "src": inputs,
+#             "tgt": tgt,
+#             "tgt_mask": None, 
+#             "src_mask": None,
+#             "tgt_token_mask": mask, # 提供 mask 給 loss function使用
+#             "labels": labels,
+#             "return_dict": return_dict
+#         }
+    
+
+
+class RandonMaskDataCollator:
+    def __init__(self, mask_prob=0.15, tgt_type="simple"):
+        self.mask_prob = mask_prob
+        self.tgt_type = tgt_type
+
+    def __call__(self, features):
+        inputs = torch.stack([f["src"] for f in features])  # (batch, 30, 100)
+        labels = torch.stack([f["label"] for f in features])  # (batch, 204, 100)
+
+        tgt = labels.clone()
+        batch_size, seq_len, feature_dim = tgt.shape  # (batch, 204, 100)
+
+        # 產生 mask
+        mask = torch.rand(batch_size, seq_len) < self.mask_prob  # (batch, 204)
+
+        # Mask策略
+        mask_rand = torch.rand(batch_size, seq_len)
+
+        zero_mask = (mask_rand < 0.8) & mask
+        random_mask = (mask_rand >= 0.8) & (mask_rand < 0.9) & mask
+
+        # Apply masking to tgt
+        tgt[zero_mask.unsqueeze(-1).expand(-1, -1, feature_dim)] = 0.0
+        noise = torch.randn_like(tgt)
+        tgt[random_mask.unsqueeze(-1).expand(-1, -1, feature_dim)] = noise[random_mask.unsqueeze(-1).expand(-1, -1, feature_dim)]
+
+        # ➡️ 加入 EEG data 到 tgt
+        if self.tgt_type == "add_eeg":
+            # 1. 把 src 貼到 tgt 後面 (在 token dimension)
+            tgt = torch.cat([tgt, inputs], dim=1)  # (batch, 204+30, 100)
+
+
+        return_dict = True
+        return {
+            "src": inputs,
+            "tgt": tgt,
+            "tgt_mask": None,
+            "src_mask": None,
+            "tgt_token_mask": mask,  # (batch, 204+30) if add_eeg
+            "labels": labels,        # 原始 label 還是204個
+            "return_dict": return_dict
+        }

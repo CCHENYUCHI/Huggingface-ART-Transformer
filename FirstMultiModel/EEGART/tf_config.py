@@ -69,18 +69,15 @@ class SLTConfig(ARTConfig):
 
     def __init__(
             self,
+            tgt_channel_size=204,
             source_voxel_time = 200,
             sensor_time = 200,
-            src_d_model = 128,
-            tgt_d_model = 200,
             **kwargs,
         ):
             super().__init__(**kwargs)
-
+            self.tgt_channel_size= tgt_channel_size
             self.source_voxel_time = source_voxel_time
             self.sensor_time = sensor_time
-            self.src_d_model = src_d_model
-            self.tgt_d_model = tgt_d_model
 
 
 class ARTEncoder_CLSConfig(PretrainedConfig):
