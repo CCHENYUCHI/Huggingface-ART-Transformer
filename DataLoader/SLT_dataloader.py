@@ -600,6 +600,46 @@ class SignalDataCollator:
 #         }
     
 
+class ART_AUG_RandonMaskDataCollator:
+    def __init__(self, mask_prob=0.15):
+        self.mask_prob = mask_prob
+
+    def __call__(self, features):
+        inputs = torch.stack([f["src"] for f in features])  
+        # input shape: (batch, 30, 1024)
+        labels = torch.stack([f["src"] for f in features]) 
+        # label shape: (batch, 30, 1024)
+
+        tgt = labels.clone()
+        # decoder input: (batch, 30, 1024)
+        batch_size, seq_len, feature_dim = tgt.shape  
+
+        # 產生 mask
+        mask = torch.rand(batch_size, seq_len) < self.mask_prob  # (batch, 30)
+
+        # Mask策略
+        mask_rand = torch.rand(batch_size, seq_len)
+
+        zero_mask = (mask_rand < 0.8) & mask
+        random_mask = (mask_rand >= 0.8) & (mask_rand < 0.9) & mask
+
+        # Apply masking to tgt
+        tgt[zero_mask.unsqueeze(-1).expand(-1, -1, feature_dim)] = 0.0
+        noise = torch.randn_like(tgt)
+        tgt[random_mask.unsqueeze(-1).expand(-1, -1, feature_dim)] = noise[random_mask.unsqueeze(-1).expand(-1, -1, feature_dim)]
+
+
+        return_dict = True
+        return {
+            "src": inputs,
+            "tgt": tgt,
+            "tgt_mask": None,
+            "src_mask": None,
+            "tgt_token_mask": mask,  # (batch, 204+30) if add_eeg
+            "labels": labels,        # 原始 label 還是204個
+            "return_dict": return_dict
+        }
+
 
 class RandonMaskDataCollator:
     def __init__(self, mask_prob=0.15, tgt_type="simple"):
@@ -615,6 +655,7 @@ class RandonMaskDataCollator:
 
         # 產生 mask
         mask = torch.rand(batch_size, seq_len) < self.mask_prob  # (batch, 204)
+        # (batch, 30)
 
         # Mask策略
         mask_rand = torch.rand(batch_size, seq_len)

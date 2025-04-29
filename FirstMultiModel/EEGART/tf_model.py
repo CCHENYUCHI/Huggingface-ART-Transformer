@@ -443,6 +443,92 @@ class ARTModel(PreTrainedModel):
             attentions=None,
         )
     
+class ART_AUG(PreTrainedModel):
+    config_class = SLTConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.c = copy.deepcopy
+       
+        self.attn = MultiHeadedAttention(config.h, config.d_model)
+        self.ff = PositionwiseFeedForward(config.d_model, config.d_ff, config.dropout)
+        self.position = PositionalEncoding(config.d_model, config.dropout)
+        self.encoder = Encoder(EncoderLayer(config.d_model, self.c(self.attn), self.c(self.ff), config.dropout), config.N)
+        self.decoder = Decoder(DecoderLayer(config.d_model, self.c(self.attn), self.c(self.attn),
+                                self.c(self.ff), config.dropout), config.N)
+        
+        self.src_projector = nn.Sequential(MLP_projector(config.sensor_time, config.d_ff, config.d_model, config.src_channel_size), self.c(self.position))
+        self.tgt_projector = nn.Sequential(MLP_projector(config.source_voxel_time, config.d_ff, config.d_model, config.tgt_channel_size), self.c(self.position))
+
+        # self.src_embed = nn.Sequential(ExpandConv(config.sensor_time, config.d_model), self.c(self.position))
+        # self.tgt_embed = nn.Sequential(ExpandConv(config.source_voxel_time, config.d_model), self.c(self.position))
+
+        self.generator = nn.Linear(config.d_model, config.source_voxel_time)
+        
+        self.loss_fct = nn.MSELoss()
+
+    def forward(self,
+        src = torch.FloatTensor, 
+        tgt = torch.FloatTensor, 
+        src_mask: Optional[torch.FloatTensor] = None, 
+        tgt_mask: Optional[torch.FloatTensor] = None, 
+        tgt_token_mask: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.FloatTensor] = None, 
+        return_dict: Optional[bool] = None, 
+        # return_loss: Optional[bool] = None, 
+        ):
+        "Token be a channel"
+        encoder_output, encoder_atten = self.encoder(self.src_projector(src), src_mask)
+        """ encoder: 
+                src shape: (b, 30, 1024) -> embed (b, 30, d_model=128)
+                input shape:  (b, 30, d_model)
+                output shape: (b, 30, d_model)
+        """
+        decoder_output, decoder_atten = self.decoder(self.tgt_projector(tgt), encoder_output, src_mask, tgt_mask, False)
+        """ decoder: 
+                tgt shape: (b, 30, 1024) -> embed (b, 30, d_model)
+                input shape:            (b, 30, 100)
+                memory encoder shape:   (b, 30, d_model)
+                attention score shape:  (b, 30, 30)
+                output shape:           (b, 30, d_model)
+        """
+        logits = self.generator(decoder_output)
+
+        ### for add EEG into tgt
+        logits = logits[:, :204, :]
+
+        if not return_dict:
+            return logits
+
+        loss = None
+        if labels is not None:
+
+            logits_mean = torch.mean(logits, dim=(1, 2), keepdim=True)
+            logits_std = torch.std(logits, dim=(1, 2), keepdim=True)
+            logits_norm = (logits - logits_mean) / (logits_std)
+
+            labels_mean = torch.mean(labels, dim=(1, 2), keepdim=True)
+            labels_std = torch.std(labels, dim=(1, 2), keepdim=True)
+            labels_norm = (labels - labels_mean) / (labels_std)
+
+            # Apply mask: tgt_token_mask is (batch, 204), expand to match (batch, 204, 100)
+            expanded_mask = tgt_token_mask.unsqueeze(-1).expand(-1, -1, logits.size(-1))  # shape (batch, 204, 100)
+            # Select only masked positions
+            masked_logits = logits_norm[expanded_mask]
+            masked_labels = labels_norm[expanded_mask]
+
+            # Compute loss only on masked elements
+            loss = self.loss_fct(masked_logits, masked_labels)
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=None,
+            hidden_states=(encoder_output, decoder_output),
+            attentions=(encoder_atten, decoder_atten),
+        )
+
+    
 class SLTModel(PreTrainedModel):
     config_class = SLTConfig
 
@@ -478,7 +564,7 @@ class SLTModel(PreTrainedModel):
         # return_loss: Optional[bool] = None, 
         ):
         "Token be a channel"
-        encoder_output, encoder_atten = self.encoder(self.src_projector(src), src_mask)   
+        encoder_output, encoder_atten = self.encoder(self.src_projector(src), src_mask)
         """ encoder: 
                 src shape: (b, 30, 100) -> embed (b, 30, d_model)
                 input shape:  (b, 30, d_model)
