@@ -394,15 +394,21 @@ class ARTModel(PreTrainedModel):
         super().__init__(config)
 
         self.c = copy.deepcopy
+        self.src_pos_embedding = nn.Embedding(config.src_len, config.d_model)
+        self.tgt_pos_embedding = nn.Embedding(config.tgt_len, config.d_model)
         self.attn = MultiHeadedAttention(config.h, config.d_model)
         self.ff = PositionwiseFeedForward(config.d_model, config.d_ff, config.dropout)
         self.position = PositionalEncoding(config.d_model, config.dropout)
         self.encoder = Encoder(EncoderLayer(config.d_model, self.c(self.attn), self.c(self.ff), config.dropout), config.N)
         self.decoder = Decoder(DecoderLayer(config.d_model, self.c(self.attn), self.c(self.attn),
                                 self.c(self.ff), config.dropout), config.N)
-        self.src_embed = nn.Sequential(ExpandConv(config.d_model, config.src_channel_size), self.c(self.position))
-        self.tgt_embed = nn.Sequential(ExpandConv(config.d_model, config.src_channel_size), self.c(self.position))
-        self.generator = Generator(config.d_model, config.tgt_channel_size)
+        self.src_embed = nn.Sequential(ExpandConv(config.d_model, config.src_channel_size), 
+                                       self.c(self.src_pos_embedding))
+        self.tgt_embed = nn.Sequential(ExpandConv(config.d_model, config.src_channel_size), 
+                                       self.c(self.tgt_pos_embedding))
+        # self.src_embed = nn.Sequential(ExpandConv(config.d_model, config.src_channel_size), self.c(self.position))
+        # self.tgt_embed = nn.Sequential(ExpandConv(config.d_model, config.src_channel_size), self.c(self.position))
+        self.generator = Generator(config.d_model, config.tgt_len)
         self.loss_fct = nn.MSELoss()
 
     def forward(self,
@@ -528,7 +534,7 @@ class ART_AUG(PreTrainedModel):
             attentions=(encoder_atten, decoder_atten),
         )
 
-    
+
 class SLTModel(PreTrainedModel):
     config_class = SLTConfig
 
@@ -538,19 +544,25 @@ class SLTModel(PreTrainedModel):
        
         self.attn = MultiHeadedAttention(config.h, config.d_model)
         self.ff = PositionwiseFeedForward(config.d_model, config.d_ff, config.dropout)
+        self.src_pos_embedding = nn.Parameter(torch.randn(1, config.src_len, config.d_model))
+        self.tgt_pos_embedding = nn.Parameter(torch.randn(1, config.tgt_len, config.d_model))
+        
         self.position = PositionalEncoding(config.d_model, config.dropout)
-        self.encoder = Encoder(EncoderLayer(config.d_model, self.c(self.attn), self.c(self.ff), config.dropout), config.N)
+        self.encoder = Encoder(EncoderLayer(config.d_model, self.c(self.attn), self.c(self.ff),
+                                             config.dropout), config.N)
         self.decoder = Decoder(DecoderLayer(config.d_model, self.c(self.attn), self.c(self.attn),
                                 self.c(self.ff), config.dropout), config.N)
         
-        self.src_projector = nn.Sequential(MLP_projector(config.sensor_time, config.d_ff, config.d_model, config.src_channel_size), self.c(self.position))
-        self.tgt_projector = nn.Sequential(MLP_projector(config.source_voxel_time, config.d_ff, config.d_model, config.tgt_channel_size), self.c(self.position))
+        # self.src_projector = nn.Sequential(MLP_projector(config.sensor_time, config.d_ff, config.d_model, config.src_channel_size), self.c(self.position))
+        # self.tgt_projector = nn.Sequential(MLP_projector(config.source_voxel_time, config.d_ff, config.d_model, config.tgt_channel_size), self.c(self.position))
+        self.src_projector = MLP_projector(config.sensor_time, config.d_ff, config.d_model, config.src_len)
+        self.tgt_projector = MLP_projector(config.source_voxel_time, config.d_ff, config.d_model, config.tgt_len)
 
         # self.src_embed = nn.Sequential(ExpandConv(config.sensor_time, config.d_model), self.c(self.position))
         # self.tgt_embed = nn.Sequential(ExpandConv(config.source_voxel_time, config.d_model), self.c(self.position))
 
         self.generator = nn.Linear(config.d_model, config.source_voxel_time)
-        
+
         self.loss_fct = nn.MSELoss()
 
     def forward(self,
@@ -558,19 +570,23 @@ class SLTModel(PreTrainedModel):
         tgt = torch.FloatTensor, 
         src_mask: Optional[torch.FloatTensor] = None, 
         tgt_mask: Optional[torch.FloatTensor] = None, 
-        tgt_token_mask: Optional[torch.FloatTensor] = None,
+        tgt_token_mask: Optional[torch.FloatTensor] = None, 
         labels: Optional[torch.FloatTensor] = None, 
         return_dict: Optional[bool] = None, 
         # return_loss: Optional[bool] = None, 
         ):
         "Token be a channel"
-        encoder_output, encoder_atten = self.encoder(self.src_projector(src), src_mask)
+        src_embedding = self.src_projector(src)
+        src_embedding = src_embedding + self.src_pos_embedding
+        encoder_output, encoder_atten = self.encoder(src_embedding, src_mask)
         """ encoder: 
                 src shape: (b, 30, 100) -> embed (b, 30, d_model)
                 input shape:  (b, 30, d_model)
                 output shape:     (b, 30, d_model)
         """
-        decoder_output, decoder_atten = self.decoder(self.tgt_projector(tgt), encoder_output, src_mask, tgt_mask, False)
+        tgt_embedding = self.tgt_projector(tgt)
+        tgt_embedding = tgt_embedding + self.tgt_pos_embedding
+        decoder_output, decoder_atten = self.decoder(tgt_embedding, encoder_output, src_mask, tgt_mask, False)
         """ decoder: 
                 tgt shape: (b, 204, 100) -> embed (b, 204, d_model)
                 input shape:            (b, 204, 100)

@@ -44,8 +44,8 @@ class ARTConfig(PretrainedConfig):
 
     def __init__(
             self,
-            src_channel_size=30,
-            tgt_channel_size=30,
+            src_len=30,
+            tgt_len=30,
             N=6,
             d_model=128,
             d_ff=2048,
@@ -55,8 +55,8 @@ class ARTConfig(PretrainedConfig):
         ):
             super().__init__(**kwargs)
 
-            self.src_channel_size = src_channel_size
-            self.tgt_channel_size = tgt_channel_size
+            self.src_len = src_len
+            self.tgt_len = tgt_len
             self.N = N
             self.d_model = d_model
             self.d_ff = d_ff
@@ -69,13 +69,13 @@ class SLTConfig(ARTConfig):
 
     def __init__(
             self,
-            tgt_channel_size=204,
+            tgt_len=204,
             source_voxel_time = 200,
             sensor_time = 200,
             **kwargs,
         ):
             super().__init__(**kwargs)
-            self.tgt_channel_size= tgt_channel_size
+            self.tgt_len= tgt_len
             self.source_voxel_time = source_voxel_time
             self.sensor_time = sensor_time
 
