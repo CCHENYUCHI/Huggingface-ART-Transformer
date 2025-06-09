@@ -11,6 +11,7 @@ from scipy.signal import decimate, resample_poly, firwin, lfilter
 from scipy.signal import resample
 from torch.utils.data import Dataset
 import bisect
+import scipy.io
 import glob
 
 def txt_to_dict_with_list(txt_file):
@@ -189,7 +190,6 @@ class EEGROIDataset(Dataset):
                 if 'roi' in f:
                     roi_data = f['roi']['source_roi_data'][:]
 
-
             # Load EEG data
             eeg_data = mne.io.read_raw_eeglab(eeg_path, preload=True).get_data()
             # end_time = time.time()
@@ -207,7 +207,6 @@ class EEGROIDataset(Dataset):
             
     def _process_subject_data(self, roi_data, eeg_data, subject_name):
         """Segments and overlaps data for a single subject."""
-
         segment_len = roi_data.shape[0]
         nan_count=0
         rand_count = 0
@@ -269,7 +268,212 @@ class EEGROIDataset(Dataset):
             "tgt_mask": None,
             "label": self.roi_data[idx]
         }
-   
+    
+class EEG_Dataset(Dataset):
+    def __init__(self, eeg_folder, group_file , group_index, window_size=200, 
+                 segment_file= "G:\\共用雲端硬碟\\CNElab_陳昱祺\\source localization\\test_data\\ROI\\Desikan_Kilianny_with_3pca\\roi_removal_segment.txt"):
+        """
+        Args:
+            roi_folder (str): Path to the folder containing ROI .set files.
+            eeg_folder (str): Path to the folder containing EEG .set files.
+            overlap (float): Fraction of overlap between consecutive windows (0 <= overlap < 1).
+            window_size (int): Number of samples in each window.
+        """
+        self.eeg_folder = eeg_folder
+        self.group_file = group_file
+        self.group_index = group_index
+        self.window_size = window_size
+        self.subjects = self._get_subject_list()
+        self.segment_file = segment_file
+        self.segment_index = txt_to_dict_with_list(self.segment_file)
+
+        self.eeg_data = []  # Will store tuples of (ROI segment, EEG segment)
+        self._prepare_dataset()
+
+    def _get_subject_list(self):
+        """Gets the list of subjects based on file names in the ROI folder."""
+        with open(self.group_file, 'r') as f:
+            groups = json.load(f)
+
+        subject_indices = groups.get(str(self.group_index), [])
+        print(subject_indices)
+        return subject_indices 
+
+    def _prepare_dataset(self):
+        """Reads and processes data for all subjects and segments them."""
+        all_segments = []  # 最後儲存所有切好的 EEG 段落
+
+        for subject in self.subjects:
+            eeg_path = os.path.join(self.eeg_folder, f"processed_{subject}_ICA_DLtrain.set")
+
+            # Load EEG data: shape = (channels=30, timepoints)
+            eeg_data = mne.io.read_raw_eeglab(eeg_path, preload=True).get_data() * 1e6
+
+            # Step 1: 確保可以整除512
+            num_segments = eeg_data.shape[1] // 512
+            eeg_data = eeg_data[:, :num_segments * 512]  # Trim data to be divisible
+
+            # Step 2: reshape 為 (num_segments, 30, 512)
+            eeg_segments = eeg_data.reshape(30, num_segments, 512).transpose(1, 0, 2)  # (num_segments, 30, 512)
+            
+            # Step 3: Downsample 每個 segment from 512 to 200
+            eeg_downsampled = resample(eeg_segments, 200, axis=2)  # Output: (num_segments, 30, 200)
+
+            all_segments.append(eeg_downsampled)
+
+        # Step 3: 堆疊所有 subject 的段落 (total_segments, 30, 512)
+        self.eeg_data = np.concatenate(all_segments, axis=0)
+        print(f"Total EEG segments: {self.eeg_data.shape}")  # Should be (N, 30, 512)
+        np.save(f"G:\\共用雲端硬碟\\CNElab_陳昱祺\\source localization\\test_data\\ROI\\EEG\\{self.group_index}.npy", self.eeg_data)
+
+    def __len__(self):
+        return len(self.eeg_data)
+
+    def __getitem__(self, idx):
+        return {
+            "src": self.eeg_data[idx], 
+            "label": self.eeg_data[idx]
+        }
+
+class EEGDatasetFromNPY(Dataset):
+    def __init__(self, npy_file_list, fft_length=None):
+        """
+        Args:
+            npy_file_list (list of str): List of paths to .npy files containing EEG data.
+                                         Each file is assumed to have shape (N_i, C, T)
+        """
+        self.data = []
+        for file in npy_file_list:
+            eeg = np.load(file)  # shape: (N_i, C, T)
+            self.data.append(eeg)
+        self.data = np.concatenate(self.data, axis=0)  # shape: (N_total, C, T)
+        self.fft_length = fft_length if fft_length is not None else self.data.shape[2]
+        self.freq_bins = self.fft_length // 2 + 1  # Keep only positive frequencies
+        self.channel_loc =  [
+                    "Fp1", "Fp2", "F7", "F3", "Fz", "F4", "F8",
+                    "FT7", "FC3", "FCz", "FC4", "FT8",
+                    "T3", "C3", "Cz", "C4", "T4",
+                    "TP7", "CP3", "CPz", "CP4", "TP8",
+                    "T5", "P3", "Pz", "P4", "T6",
+                    "O1", "Oz", "O2"
+                ]
+
+        
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        eeg = self.data[idx] * 1e6  # shape: (C, T)
+        # Apply FFT over time axis for each channel
+        fft_result = np.fft.rfft(eeg, n=self.fft_length, axis=-1)  # shape: (C, F)
+        magnitude = np.abs(fft_result)  # 取 magnitude
+        mean = np.mean(magnitude, axis=(0, 1), keepdims=True)
+        std = np.std(magnitude, axis=(0, 1), keepdims=True)
+        src_ = (magnitude - mean) / (std)
+        return {
+            "src": torch.tensor(src_, dtype=torch.float32),  # shape: (C, F)
+            "montage": self.channel_loc,
+        }
+
+# class TshingHwa_Dataset(Dataset):
+#     def __init__(self, eeg_folder, sampling_rate=250, save_path=None):
+#         """
+#         Args:
+#             eeg_folder (str): Path to the folder containing .mat EEG files.
+#             sampling_rate (int): EEG sampling rate, default = 250Hz.
+#             save_path (str): Optional path to save the merged .npy dataset.
+#         """
+#         self.eeg_folder = eeg_folder
+#         self.sampling_rate = sampling_rate
+#         self.channel_loc = [
+#             "Fp1", "Fpz", "Fp2", "Af3", "Af4", "F7", "F5", "F3", "F1", "Fz", "F2", "F4", "F6", "F8",
+#             "Ft7", "Fc5", "Fc3", "Fc1", "Fcz", "Fc2", "Fc4", "Fc6", "Ft8", "T7", "C5", "C3", "C1",
+#             "Cz", "C2", "C4", "C6", "T8", "M1", "Tp7", "Cp5", "Cp3", "Cp1", "Cpz", "Cp2", "Cp4",
+#             "Cp6", "Tp8", "M2", "P7", "P5", "P3", "P1", "Pz", "P2", "P4", "P6", "P8", "Po7", "Po5",
+#             "Po3", "Poz", "Po4", "Po6", "Po8", "Cb1", "O1", "Oz", "O2", "Cb2"
+#         ]
+
+
+#         self.eeg_data = self._load_and_process_all()
+
+#         if save_path:
+#             np.save(save_path, self.eeg_data)
+
+#     def _load_and_process_all(self):
+#         all_fft_segments = []
+
+#         for filename in os.listdir(self.eeg_folder):
+#             if filename.endswith(".mat"):
+#                 file_path = os.path.join(self.eeg_folder, filename)
+#                 print(f"Processing: {filename}")
+#                 fft_data = self._process_single_mat(file_path)  # (720, 64, 101)
+#                 all_fft_segments.append(fft_data)
+
+#         # Concatenate across subjects along the 0th axis
+#         merged = np.concatenate(all_fft_segments, axis=0)  # (N, 64, 101)
+#         print(f"Merged FFT data shape: {merged.shape}")
+#         np.save(f"G:\\共用雲端硬碟\\CNElab_陳昱祺\\source localization\\test_data\\tshinghwa\\train_dataset.npy", merged)
+#         return merged.astype(np.float32)
+
+#     def _process_single_mat(self, file_path):
+#         mat = scipy.io.loadmat(file_path)
+#         data = mat['data']  # shape: (64, 1500, 40, 6)
+
+#         data = np.transpose(data, (2, 3, 0, 1))  # (40, 6, 64, 1500)
+
+#         segments = []
+#         for i in range(3):
+#             seg = data[:, :, :, i*500:(i+1)*500]  # (40, 6, 64, 500)
+#             segments.append(seg)
+
+#         data_split = np.concatenate(segments, axis=1)  # (40, 18, 64, 500)
+#         return data_split
+
+#     def __len__(self):
+#         return self.eeg_data.shape[0]  # total segments
+
+#     def __getitem__(self, idx):
+#         sample = self.eeg_data[idx]  # (64, 101)
+#         return {
+#             "src": torch.from_numpy(sample),
+#             "montage": self.channel_loc,
+#         }
+class TshingHwa_Dataset(Dataset):
+    def __init__(self, npy_file_list, sampling_rate=250):
+        """
+        Args:
+            eeg_folder (str): Path to the folder containing .mat EEG files.
+            sampling_rate (int): EEG sampling rate, default = 250Hz.
+            save_path (str): Optional path to save the merged .npy dataset.
+        """
+        self.sampling_rate = sampling_rate
+        self.channel_loc = [
+            "Fp1", "Fpz", "Fp2", "AF3", "AF4", "F7", "F5", "F3", "F1", "Fz", "F2", "F4", "F6", "F8",
+            "FT7", "FC5", "FC3", "FC1", "FCz", "FC2", "FC4", "FC6", "FT8", "T7", "C5", "C3", "C1",
+            "Cz", "C2", "C4", "C6", "T8", "M1", "TP7", "CP5", "CP3", "CP1", "CPz", "CP2", "CP4",
+            "CP6", "TP8", "M2", "P7", "P5", "P3", "P1", "Pz", "P2", "P4", "P6", "P8", "PO7", "PO5",
+            "PO3", "POz", "PO4", "PO6", "PO8", "CB1", "O1", "Oz", "O2", "CB2"
+        ]
+        self.data = []
+        for file in npy_file_list:
+            eeg = np.load(file)  # shape: (N_i, C, T)
+            self.data.append(eeg)
+        self.data = np.concatenate(self.data, axis=0)  # shape: (N_total, C, T)
+
+        
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        magnitude = self.data[idx]  # shape: (C, T)
+        mean = np.mean(magnitude, axis=(0, 1), keepdims=True)
+        std = np.std(magnitude, axis=(0, 1), keepdims=True)
+        src_ = (magnitude - mean) / (std)
+        return {
+            "src": torch.tensor(src_, dtype=torch.float32),  # shape: (C, F)
+            "montage": self.channel_loc,
+        }
+
 class EEGROI_fft_Dataset(Dataset):
     def __init__(self, roi_folder, eeg_folder, group_file , group_index, overlap=0.5, window_size=512, 
                  segment_file= "G:\\共用雲端硬碟\\CNElab_陳昱祺\\source localization\\test_data\\ROI\\Desikan_Kilianny_with_3pca\\roi_removal_segment.txt"):
@@ -330,7 +534,7 @@ class EEGROI_fft_Dataset(Dataset):
         print(f"EEG Power shape: {self.eeg_power_data[0].shape}")
         print(f"Source Power shape: {self.roi_power_data[0].shape}")
 
-            
+
     def _process_subject_data(self, roi_data, eeg_data, subject_name):
         """Segments, computes EEG power spectrum, and predicts ROI power spectrum for a single subject."""
 
@@ -643,3 +847,184 @@ class RandonMaskDataCollator:
             "labels": labels,        # 原始 label 還是204個
             "return_dict": return_dict
         }
+
+class RandonMaskEEGDataCollator:
+    def __init__(self, mask_prob=0.15):
+        self.mask_prob = mask_prob
+
+    def __call__(self, features):
+        inputs = torch.stack([f["src"] for f in features])  # (batch, 30, 200)
+        labels = inputs.clone()
+
+        batch_size, seq_len, feature_dim = inputs.shape  # (batch, 30, 100)
+
+        # 產生 mask
+        mask = torch.rand(batch_size, seq_len) < self.mask_prob  # (batch, 30)
+
+        # Mask策略
+        mask_rand = torch.rand(batch_size, seq_len)
+
+        zero_mask = (mask_rand < 0.8) & mask
+        random_mask = (mask_rand >= 0.8) & (mask_rand < 0.9) & mask
+
+        # Apply masking to tgt
+        inputs[zero_mask.unsqueeze(-1).expand(-1, -1, feature_dim)] = 0.0
+        noise = torch.randn_like(inputs)
+        inputs[random_mask.unsqueeze(-1).expand(-1, -1, feature_dim)] = noise[random_mask.unsqueeze(-1).expand(-1, -1, feature_dim)]
+
+
+        return_dict = True
+        return {
+            "src": inputs,
+            "tgt": inputs,
+            "tgt_mask": None,
+            "src_mask": None,
+            "tgt_token_mask": mask,  
+            "labels": labels,        
+            "return_dict": return_dict
+        }
+    
+class RandonMaskShuffleEEGDataCollator:
+    def __init__(self, mask_prob=0.15, montage_kind="standard_1020"):
+        self.mask_prob = mask_prob
+        self.mne_montage = mne.channels.make_standard_montage(montage_kind)
+
+        # 建立 channel_name -> (x, y, z) dict
+        self.channel_pos_map = {
+            ch_name: torch.tensor(pos, dtype=torch.float32) / torch.norm(torch.tensor(pos, dtype=torch.float32))
+            for ch_name, pos in self.mne_montage.get_positions()['ch_pos'].items()
+        }
+    def __call__(self, features):
+        src_list = []
+        label_list = []
+        pos_list = []
+        montage_name_list = []
+        lengths = []
+        
+
+        max_len = max(f["src"].shape[0] for f in features)  # 最大 channel 數
+        feature_dim = features[0]["src"].shape[1]
+
+        for f in features:
+            src = f["src"]  # (channel_num, feature_dim)
+            montage_names = f["montage"]
+            channel_num = src.shape[0]
+
+            # shuffle channel
+            perm = torch.randperm(channel_num)
+            shuffled_src = src[perm]
+            shuffled_names = [montage_names[i] for i in perm.tolist()]
+
+            # get 3D position
+            pos_3d = torch.stack([
+                self.channel_pos_map.get(name, torch.zeros(3)) for name in shuffled_names
+            ])
+
+            # padding
+            pad_len = max_len - channel_num
+            if pad_len > 0:
+                pad_src = torch.zeros((pad_len, feature_dim))
+                pad_pos = torch.zeros((pad_len, 3))
+                shuffled_src = torch.cat([shuffled_src, pad_src], dim=0)
+                pos_3d = torch.cat([pos_3d, pad_pos], dim=0)
+
+            src_list.append(shuffled_src)
+            label_list.append(shuffled_src.clone())
+            pos_list.append(pos_3d)
+            lengths.append(channel_num)
+            montage_name_list.append(shuffled_names)
+
+        inputs = torch.stack(src_list)        # (B, max_len, F)
+        labels = torch.stack(label_list)      # (B, max_len, F)
+        positions = torch.stack(pos_list)     # (B, max_len, 3)
+        # montage = torch.stack(montage_name_list)
+
+        batch_size, seq_len, feature_dim = inputs.shape
+
+        # valid mask: 哪些 channel 是有效的
+        valid_mask = torch.arange(seq_len).unsqueeze(0) < torch.tensor(lengths).unsqueeze(1)  # (B, C)
+
+        # --- 隨機 Mask 機制 ---
+        rand = torch.rand(batch_size, seq_len)
+        tgt_token_mask = (rand < self.mask_prob) & valid_mask  # 只 mask 有效 channel
+
+        mask_rand = torch.rand(batch_size, seq_len)
+        zero_mask = (mask_rand < 0.8) & tgt_token_mask
+        random_mask = (mask_rand >= 0.8) & (mask_rand < 0.9) & tgt_token_mask
+
+        inputs[zero_mask.unsqueeze(-1).expand(-1, -1, feature_dim)] = 0.0
+        noise = torch.randn_like(inputs)
+        inputs[random_mask.unsqueeze(-1).expand(-1, -1, feature_dim)] = noise[random_mask.unsqueeze(-1).expand(-1, -1, feature_dim)]
+
+        # --- Attention mask (B, C, C) ---
+        attn_mask = (valid_mask.unsqueeze(1) & valid_mask.unsqueeze(2))  # True = masked
+
+        return {
+            "src": inputs,
+            "tgt": inputs,
+            "labels": labels,
+            "tgt_token_mask": tgt_token_mask,   # 哪些 channel 是 masked
+            "valid_channel_mask": valid_mask,   # 哪些 channel 是有效的
+            "src_mask": attn_mask,
+            "tgt_mask": attn_mask,
+            "montage": montage_name_list,  # (B, C, 3)
+            "position": positions,
+            "return_dict": True
+        }
+
+
+
+    # def __call__(self, features):
+    #     src_list = []
+    #     label_list = []
+    #     pos_list = []
+
+    #     for f in features:
+    #         src = f["src"]  # (channel_num, 101)
+    #         montage_names = f["montage"]  # list of channel names (length = channel_num)
+
+    #         # 隨機打亂 channel 順序
+    #         perm = torch.randperm(len(montage_names))
+    #         shuffled_src = src[perm]
+    #         shuffled_names = [montage_names[i] for i in perm.tolist()]
+
+    #         # 快速查表，未找到的填 0
+    #         pos_3d = torch.stack([
+    #             self.channel_pos_map.get(name, torch.zeros(3)) for name in shuffled_names
+    #         ])  # shape: (channel_num, 3)
+
+    #         for name in shuffled_names:
+    #             print(name, self.channel_pos_map.get(name))
+
+    #         src_list.append(shuffled_src)
+    #         label_list.append(shuffled_src.clone())
+    #         pos_list.append(pos_3d)
+
+    #     inputs = torch.stack(src_list)       # (batch, channel_num, 101)
+    #     labels = torch.stack(label_list)     # (batch, channel_num, 101)
+    #     positions = torch.stack(pos_list)    # (batch, channel_num, 3)
+
+    #     batch_size, seq_len, feature_dim = inputs.shape
+
+    #     # 產生 mask
+    #     mask = torch.rand(batch_size, seq_len) < self.mask_prob
+
+    #     # Mask策略
+    #     mask_rand = torch.rand(batch_size, seq_len)
+    #     zero_mask = (mask_rand < 0.8) & mask
+    #     random_mask = (mask_rand >= 0.8) & (mask_rand < 0.9) & mask
+
+    #     inputs[zero_mask.unsqueeze(-1).expand(-1, -1, feature_dim)] = 0.0
+    #     noise = torch.randn_like(inputs)
+    #     inputs[random_mask.unsqueeze(-1).expand(-1, -1, feature_dim)] = noise[random_mask.unsqueeze(-1).expand(-1, -1, feature_dim)]
+
+    #     return {
+    #         "src": inputs,
+    #         "tgt": inputs,
+    #         "labels": labels,
+    #         "tgt_token_mask": mask,
+    #         "src_mask": None,
+    #         "tgt_mask": None,
+    #         "montage": positions,  # (batch, channel_num, 3)
+    #         "return_dict": True
+    #     }
